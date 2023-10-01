@@ -3,7 +3,7 @@ module github.com/sagernet/sing-quic
 go 1.20
 
 require (
-	github.com/sagernet/quic-go v0.0.0-20230919101909-0cc6c5dcecee
+	github.com/sagernet/quic-go v0.0.0-20231001051131-0fc736a289bb
 	github.com/sagernet/sing v0.2.12
 	golang.org/x/crypto v0.13.0
 	golang.org/x/exp v0.0.0-20230905200255-921286631fa9
