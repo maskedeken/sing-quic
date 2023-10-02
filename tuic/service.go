@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/sing-quic"
+	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/baderror"
@@ -195,7 +195,6 @@ func (s *serverSession[U]) handle() {
 	go s.loopStreams()
 	go s.loopMessages()
 	go s.handleAuthTimeout()
-	go s.loopHeartbeats()
 }
 
 func (s *serverSession[U]) loopUniStreams() {
@@ -364,22 +363,6 @@ func (s *serverSession[U]) handleStream(stream quic.Stream) error {
 		Destination: destination,
 	})
 	return nil
-}
-
-func (s *serverSession[U]) loopHeartbeats() {
-	ticker := time.NewTicker(s.heartbeat)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.connDone:
-			return
-		case <-ticker.C:
-			err := s.quicConn.SendMessage([]byte{Version, CommandHeartbeat})
-			if err != nil {
-				s.closeWithError(E.Cause(err, "send heartbeat"))
-			}
-		}
-	}
 }
 
 func (s *serverSession[U]) closeWithError(err error) {
