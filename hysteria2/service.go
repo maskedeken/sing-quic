@@ -2,7 +2,9 @@ package hysteria2
 
 import (
 	"context"
+	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -16,13 +18,13 @@ import (
 	"github.com/sagernet/sing-quic"
 	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
-	hyCC "github.com/sagernet/sing-quic/hysteria2/congestion"
+	"github.com/sagernet/sing-quic/hysteria"
+	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/baderror"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -71,12 +73,12 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:                !options.UDPDisabled,
 		MaxIncomingStreams:             1 << 60,
-		InitialStreamReceiveWindow:     defaultStreamReceiveWindow,
-		MaxStreamReceiveWindow:         defaultStreamReceiveWindow,
-		InitialConnectionReceiveWindow: defaultConnReceiveWindow,
-		MaxConnectionReceiveWindow:     defaultConnReceiveWindow,
-		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		KeepAlivePeriod:                defaultKeepAlivePeriod,
+		InitialStreamReceiveWindow:     hysteria.DefaultStreamReceiveWindow,
+		MaxStreamReceiveWindow:         hysteria.DefaultStreamReceiveWindow,
+		InitialConnectionReceiveWindow: hysteria.DefaultConnReceiveWindow,
+		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
+		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
+		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 	}
 	if options.MasqueradeHandler == nil {
 		options.MasqueradeHandler = http.NotFoundHandler()
@@ -133,7 +135,7 @@ func (s *Service[U]) loopConnections(listener qtls.Listener) {
 	for {
 		connection, err := listener.Accept(s.ctx)
 		if err != nil {
-			if E.IsClosedOrCanceled(err) {
+			if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
 				s.logger.Debug(E.Cause(err, "listener closed"))
 			} else {
 				s.logger.Error(E.Cause(err, "listener closed"))
@@ -195,14 +197,7 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.authUser = user
 		s.authenticated = true
 		if !s.ignoreClientBandwidth && request.Rx > 0 {
-			var sendBps uint64
-			if s.sendBPS > 0 && s.sendBPS < request.Rx {
-				sendBps = s.sendBPS
-			} else {
-				sendBps = request.Rx
-			}
-			format.ToString(1024 * 1024)
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(sendBps, s.brutalDebug, s.logger))
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(request.Rx))), s.brutalDebug, s.logger))
 		} else {
 			timeFunc := ntp.TimeFuncFromContext(s.ctx)
 			if timeFunc == nil {
