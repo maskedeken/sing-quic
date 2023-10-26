@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -197,7 +196,11 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.authUser = user
 		s.authenticated = true
 		if !s.ignoreClientBandwidth && request.Rx > 0 {
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(uint64(math.Min(float64(s.sendBPS), float64(request.Rx))), s.brutalDebug, s.logger))
+			rx := request.Rx
+			if s.sendBPS > 0 && rx > s.sendBPS {
+				rx = s.sendBPS
+			}
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger))
 		} else {
 			timeFunc := ntp.TimeFuncFromContext(s.ctx)
 			if timeFunc == nil {
