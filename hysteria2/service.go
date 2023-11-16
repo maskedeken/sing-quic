@@ -2,33 +2,39 @@ package hysteria2
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-quic"
-	"github.com/sagernet/sing-quic/congestion"
-	hyCC "github.com/sagernet/sing-quic/hysteria2/congestion"
+	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+	"github.com/sagernet/sing-quic/hysteria"
+	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/baderror"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
 )
 
 type ServiceOptions struct {
 	Context               context.Context
 	Logger                logger.Logger
+	BrutalDebug           bool
 	SendBPS               uint64
 	ReceiveBPS            uint64
 	IgnoreClientBandwidth bool
@@ -47,6 +53,7 @@ type ServerHandler interface {
 type Service[U comparable] struct {
 	ctx                   context.Context
 	logger                logger.Logger
+	brutalDebug           bool
 	sendBPS               uint64
 	receiveBPS            uint64
 	ignoreClientBandwidth bool
@@ -65,19 +72,23 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
 		EnableDatagrams:                !options.UDPDisabled,
 		MaxIncomingStreams:             1 << 60,
-		InitialStreamReceiveWindow:     defaultStreamReceiveWindow,
-		MaxStreamReceiveWindow:         defaultStreamReceiveWindow,
-		InitialConnectionReceiveWindow: defaultConnReceiveWindow,
-		MaxConnectionReceiveWindow:     defaultConnReceiveWindow,
-		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		KeepAlivePeriod:                defaultKeepAlivePeriod,
+		InitialStreamReceiveWindow:     hysteria.DefaultStreamReceiveWindow,
+		MaxStreamReceiveWindow:         hysteria.DefaultStreamReceiveWindow,
+		InitialConnectionReceiveWindow: hysteria.DefaultConnReceiveWindow,
+		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
+		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
+		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
 	}
 	if options.MasqueradeHandler == nil {
 		options.MasqueradeHandler = http.NotFoundHandler()
 	}
+	if len(options.TLSConfig.NextProtos()) == 0 {
+		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
+	}
 	return &Service[U]{
 		ctx:                   options.Context,
 		logger:                options.Logger,
+		brutalDebug:           options.BrutalDebug,
 		sendBPS:               options.SendBPS,
 		receiveBPS:            options.ReceiveBPS,
 		ignoreClientBandwidth: options.IgnoreClientBandwidth,
@@ -126,7 +137,7 @@ func (s *Service[U]) loopConnections(listener qtls.Listener) {
 	for {
 		connection, err := listener.Accept(s.ctx)
 		if err != nil {
-			if E.IsClosedOrCanceled(err) {
+			if E.IsClosedOrCanceled(err) || errors.Is(err, quic.ErrServerClosed) {
 				s.logger.Debug(E.Cause(err, "listener closed"))
 			} else {
 				s.logger.Error(E.Cause(err, "listener closed"))
@@ -188,20 +199,20 @@ func (s *serverSession[U]) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.authUser = user
 		s.authenticated = true
 		if !s.ignoreClientBandwidth && request.Rx > 0 {
-			var sendBps uint64
-			if s.sendBPS > 0 && s.sendBPS < request.Rx {
-				sendBps = s.sendBPS
-			} else {
-				sendBps = request.Rx
+			rx := request.Rx
+			if s.sendBPS > 0 && rx > s.sendBPS {
+				rx = s.sendBPS
 			}
-			format.ToString(1024 * 1024)
-			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(sendBps))
+			s.quicConn.SetCongestionControl(hyCC.NewBrutalSender(rx, s.brutalDebug, s.logger))
 		} else {
-			s.quicConn.SetCongestionControl(congestion.NewBBRSender(
-				congestion.DefaultClock{},
-				congestion.GetInitialPacketSize(s.quicConn.RemoteAddr()),
-				congestion.InitialCongestionWindow*congestion.InitialMaxDatagramSize,
-				congestion.DefaultBBRMaxCongestionWindow*congestion.InitialMaxDatagramSize,
+			timeFunc := ntp.TimeFuncFromContext(s.ctx)
+			if timeFunc == nil {
+				timeFunc = time.Now
+			}
+			s.quicConn.SetCongestionControl(congestion_meta2.NewBbrSender(
+				congestion_meta2.DefaultClock{TimeFunc: timeFunc},
+				congestion_meta2.GetInitialPacketSize(s.quicConn.RemoteAddr()),
+				congestion.ByteCount(congestion_meta1.InitialCongestionWindow),
 			))
 		}
 		protocol.AuthResponseToHeader(w.Header(), protocol.AuthResponse{

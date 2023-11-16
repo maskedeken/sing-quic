@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +23,8 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
+
+	"github.com/gofrs/uuid/v5"
 )
 
 type ServiceOptions struct {
@@ -113,7 +115,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 			for {
 				connection, hErr := listener.Accept(s.ctx)
 				if hErr != nil {
-					if E.IsClosedOrCanceled(hErr) {
+					if E.IsClosedOrCanceled(hErr) || errors.Is(hErr, quic.ErrServerClosed) {
 						s.logger.Debug(E.Cause(hErr, "listener closed"))
 					} else {
 						s.logger.Error(E.Cause(hErr, "listener closed"))
@@ -133,7 +135,7 @@ func (s *Service[U]) Start(conn net.PacketConn) error {
 			for {
 				connection, hErr := listener.Accept(s.ctx)
 				if hErr != nil {
-					if strings.Contains(hErr.Error(), "server closed") {
+					if E.IsClosedOrCanceled(hErr) || errors.Is(hErr, quic.ErrServerClosed) {
 						s.logger.Debug(E.Cause(hErr, "listener closed"))
 					} else {
 						s.logger.Error(E.Cause(hErr, "listener closed"))
@@ -242,7 +244,7 @@ func (s *serverSession[U]) handleUniStream(stream quic.ReceiveStream) error {
 		copy(userUUID[:], buffer.Range(2, 2+16))
 		user, loaded := s.userMap[userUUID]
 		if !loaded {
-			return E.New("authentication: unknown user ", userUUID)
+			return E.New("authentication: unknown user ", uuid.UUID(userUUID))
 		}
 		handshakeState := s.quicConn.ConnectionState()
 		tuicToken, err := handshakeState.ExportKeyingMaterial(string(userUUID[:]), []byte(s.passwordMap[user]), 32)

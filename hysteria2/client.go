@@ -12,28 +12,29 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
+	"github.com/sagernet/quic-go/congestion"
+	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-quic"
-	"github.com/sagernet/sing-quic/congestion"
-	hyCC "github.com/sagernet/sing-quic/hysteria2/congestion"
+	congestion_meta1 "github.com/sagernet/sing-quic/congestion_meta1"
+	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
+	"github.com/sagernet/sing-quic/hysteria"
+	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common/baderror"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	aTLS "github.com/sagernet/sing/common/tls"
-)
-
-const (
-	defaultStreamReceiveWindow = 8388608                            // 8MB
-	defaultConnReceiveWindow   = defaultStreamReceiveWindow * 5 / 2 // 20MB
-	defaultMaxIdleTimeout      = 30 * time.Second
-	defaultKeepAlivePeriod     = 10 * time.Second
 )
 
 type ClientOptions struct {
 	Context            context.Context
 	Dialer             N.Dialer
+	Logger             logger.Logger
+	BrutalDebug        bool
 	ServerAddress      M.Socksaddr
 	SendBPS            uint64
 	ReceiveBPS         uint64
@@ -46,6 +47,8 @@ type ClientOptions struct {
 type Client struct {
 	ctx                context.Context
 	dialer             N.Dialer
+	logger             logger.Logger
+	brutalDebug        bool
 	serverAddr         M.Socksaddr
 	sendBPS            uint64
 	receiveBPS         uint64
@@ -62,17 +65,22 @@ type Client struct {
 func NewClient(options ClientOptions) (*Client, error) {
 	quicConfig := &quic.Config{
 		DisablePathMTUDiscovery:        !(runtime.GOOS == "windows" || runtime.GOOS == "linux" || runtime.GOOS == "android" || runtime.GOOS == "darwin"),
-		EnableDatagrams:                true,
-		InitialStreamReceiveWindow:     defaultStreamReceiveWindow,
-		MaxStreamReceiveWindow:         defaultStreamReceiveWindow,
-		InitialConnectionReceiveWindow: defaultConnReceiveWindow,
-		MaxConnectionReceiveWindow:     defaultConnReceiveWindow,
-		MaxIdleTimeout:                 defaultMaxIdleTimeout,
-		KeepAlivePeriod:                defaultKeepAlivePeriod,
+		EnableDatagrams:                !options.UDPDisabled,
+		InitialStreamReceiveWindow:     hysteria.DefaultStreamReceiveWindow,
+		MaxStreamReceiveWindow:         hysteria.DefaultStreamReceiveWindow,
+		InitialConnectionReceiveWindow: hysteria.DefaultConnReceiveWindow,
+		MaxConnectionReceiveWindow:     hysteria.DefaultConnReceiveWindow,
+		MaxIdleTimeout:                 hysteria.DefaultMaxIdleTimeout,
+		KeepAlivePeriod:                hysteria.DefaultKeepAlivePeriod,
+	}
+	if len(options.TLSConfig.NextProtos()) == 0 {
+		options.TLSConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
 	return &Client{
 		ctx:                options.Context,
 		dialer:             options.Dialer,
+		logger:             options.Logger,
+		brutalDebug:        options.BrutalDebug,
 		serverAddr:         options.ServerAddress,
 		sendBPS:            options.SendBPS,
 		receiveBPS:         options.ReceiveBPS,
@@ -150,20 +158,23 @@ func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
 		actualTx = c.sendBPS
 	}
 	if !authResponse.RxAuto && actualTx > 0 {
-		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx))
+		quicConn.SetCongestionControl(hyCC.NewBrutalSender(actualTx, c.brutalDebug, c.logger))
 	} else {
-		quicConn.SetCongestionControl(congestion.NewBBRSender(
-			congestion.DefaultClock{},
-			congestion.GetInitialPacketSize(quicConn.RemoteAddr()),
-			congestion.InitialCongestionWindow*congestion.InitialMaxDatagramSize,
-			congestion.DefaultBBRMaxCongestionWindow*congestion.InitialMaxDatagramSize,
+		timeFunc := ntp.TimeFuncFromContext(c.ctx)
+		if timeFunc == nil {
+			timeFunc = time.Now
+		}
+		quicConn.SetCongestionControl(congestion_meta2.NewBbrSender(
+			congestion_meta2.DefaultClock{TimeFunc: timeFunc},
+			congestion_meta2.GetInitialPacketSize(quicConn.RemoteAddr()),
+			congestion.ByteCount(congestion_meta1.InitialCongestionWindow),
 		))
 	}
 	conn := &clientQUICConnection{
 		quicConn:    quicConn,
 		rawConn:     udpConn,
 		connDone:    make(chan struct{}),
-		udpDisabled: c.udpDisabled || !authResponse.UDPEnabled,
+		udpDisabled: !authResponse.UDPEnabled,
 		udpConnMap:  make(map[uint32]*udpPacketConn),
 	}
 	if !c.udpDisabled {
